@@ -4,15 +4,16 @@ pragma solidity ^0.8.0;
 import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import "../rewards/IMendiCToken.sol";
 import "../comm/TransferHelper.sol";
 import "../rewards/IRewardNew.sol";
 import "./IFarm.sol";
 
-contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, ReentrancyGuardUpgradeable, IFarm {
-    using SafeERC20 for IERC20;
+contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable,
+ReentrancyGuardUpgradeable, PausableUpgradeable, IFarm {
     using EnumerableSet for EnumerableSet.AddressSet;
 
     // Custom errors
@@ -36,6 +37,9 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
 
     /// @notice Emitted when set the start timestamp
     event EventSetMendiCToken(address indexed _cTokenAddr);
+
+    /// @notice Emitted when start to mint
+    event EventStartMinting(uint256 timestamp);
 
     // Assets token
     IERC20 public assetToken;
@@ -61,6 +65,13 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
     // Farm start timestamp
     uint256 public startTimestamp;
 
+    // Reserved storage acts as a buffer between the last variable and the end of the slot
+    uint256[50] private __gap;
+
+    constructor() {
+        _disableInitializers();
+    }
+
     /// @notice Initialize the farm
     function initialize(
         address _assets,
@@ -69,12 +80,14 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
     ) public initializer {
         __Ownable_init(msg.sender);
         __ReentrancyGuard_init();
+        __Pausable_init();
+
+        require(_assets != address(0), "Invalid assets address");
+        require(_mendiCToken != address(0), "Invalid cToken address");
 
         assetToken = IERC20(_assets);
         mendiCToken = IMendiCToken(_mendiCToken);
         ethAddr = _ethAddr;
-
-        totalDeposits = 0;
     }
 
     /// @notice Add new reward token to pool
@@ -82,7 +95,8 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
     function addExtraReward(address _rewardTokenAddr) external onlyOwner {
         require(_rewardTokenAddr != address(0), "Invalid reward address");
 
-        for (uint256 i = 0; i < extraRewards.length; i++) {
+        uint256 len = extraRewards.length;
+        for (uint256 i = 0; i < len; i++) {
             if (address(extraRewards[i]) == _rewardTokenAddr) {
                 revert RewardTokenExisted(_rewardTokenAddr);
             }
@@ -101,14 +115,21 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
 
         for (uint256 i = 0; i < extraRewards.length; i++) {
             if (address(extraRewards[i]) == _rewardTokenAddr) {
-
                 IRewardNew _reward = IRewardNew(_rewardTokenAddr);
+
                 for (uint256 j = 0; j < userList.length; j++) {
                     UserInfo storage userInfo = userInfoMap[userList[j]];
                     uint256 rewardAmount = _reward.calculateReward(userList[j],
                         extraRewards[i].isSettledIncome() ? userInfo.underlyingAmount : 0);
 
-                    _reward.distributeReward(userList[j], rewardAmount);
+                    // Liquidity reward
+                    if (extraRewards[i].isSettledIncome() == false) {
+                        extraRewards[i].updatePool();
+                    }
+
+                    if (rewardAmount > 0) {
+                        _reward.distributeReward(userList[j], rewardAmount);
+                    }
                 }
 
                 extraRewards[i] = extraRewards[extraRewards.length - 1];
@@ -121,9 +142,34 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
         emit RemoveExtraRewardToken(_rewardTokenAddr);
     }
 
+    /// @notice Get the total reward to distribute
+    function getRemovalRewardAmounts(address _rewardTokenAddr) external onlyOwner view returns (uint256){
+        require(_rewardTokenAddr != address(0), "Invalid reward address");
+
+        uint256 totalRewardsToDistribute = 0;
+
+        address[] memory userList = userAddrList.values();
+
+        // Calculate total rewards to distribute
+        for (uint256 i = 0; i < extraRewards.length; i++) {
+            if (address(extraRewards[i]) == _rewardTokenAddr) {
+                IRewardNew _reward = IRewardNew(_rewardTokenAddr);
+
+                for (uint256 j = 0; j < userList.length; j++) {
+                    UserInfo storage userInfo = userInfoMap[userList[j]];
+                    totalRewardsToDistribute += _reward.calculateReward(userList[j],
+                        extraRewards[i].isSettledIncome() ? userInfo.underlyingAmount : 0);
+                }
+                break;
+            }
+        }
+
+        return totalRewardsToDistribute;
+    }
+
     /// @notice Deposit assets to the farm
     /// @param _amount The amount of assets to deposit
-    function deposit(uint256 _amount) external payable nonReentrant {
+    function deposit(uint256 _amount) external payable nonReentrant whenNotPaused {
         require(startTimestamp > 0, "Farm: mining not start!!");
 
         UserInfo storage userInfo = userInfoMap[msg.sender];
@@ -141,18 +187,19 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
         } else {
             require(msg.value == 0, "Deposit invalid token");
             if (_amount > 0) {
+                uint256 _beforeBalance = assetToken.balanceOf(address(this));
                 TransferHelper.safeTransferFrom(address(assetToken), address(msg.sender), address(this), _amount);
+                _amount = assetToken.balanceOf(address(this)) - _beforeBalance;
             }
-
-            assetToken.approve(address(mendiCToken), _amount);
         }
-
-        // Save assets to Mendi
-        assetToken.approve(address(mendiCToken), _amount);
-        mendiCToken.mint(_amount);
 
         // Calculate the cToken
         uint256 calcCToken = underlyingToCToken(_amount);
+
+        // Save assets to Mendi
+        TransferHelper.safeApprove(address(assetToken), address(mendiCToken), _amount);
+        mendiCToken.mint(_amount);
+
         userInfo.underlyingAmount += _amount;
         userInfo.cTokenAmount += calcCToken;
         userInfo.lastDepositTime = block.timestamp;
@@ -168,7 +215,7 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
 
     /// @notice Withdraw assets from the farm
     /// @param _amount The amount of assets to withdraw
-    function withdraw(uint256 _amount) external nonReentrant {
+    function withdraw(uint256 _amount) external nonReentrant whenNotPaused {
         require(_amount > 0, "Invalid deposit amount");
         require(startTimestamp > 0, "Mining not start!!");
 
@@ -178,7 +225,8 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
         // Distribute rewards to user
         distributeAllRewards(msg.sender);
 
-        mendiCToken.redeemUnderlying(_amount);
+        uint success = mendiCToken.redeemUnderlying(_amount);
+        require(success == 0, "Redeem failed");
 
         uint256 reduceCTokenAmount = underlyingToCToken(_amount);
 
@@ -206,7 +254,7 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
 
     /// @notice Calculate the rewards and transfer to user
     /// @param _user The user address
-    function harvest(address _user) external nonReentrant {
+    function harvest(address _user) external nonReentrant whenNotPaused {
         require(startTimestamp > 0, "Mining not start!!");
         require(_user != address(0), "Farm: invalid user address");
 
@@ -219,6 +267,11 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
             uint256 pendingRewards = extraRewards[i].calculateReward(_user,
                 _extraReward.isSettledIncome() ? userInfo.underlyingAmount : 0);
 
+            // Liquidity reward
+            if (_extraReward.isSettledIncome() == false) {
+                _extraReward.updatePool();
+            }
+
             if (pendingRewards > 0) {
                 _extraReward.distributeReward(_user, pendingRewards);
             }
@@ -226,15 +279,19 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
     }
 
     /// @notice Start to mint
-    function startMining() public onlyOwner {
+    function startMining() public onlyOwner whenNotPaused {
         require(startTimestamp == 0, "Farm: mining already started");
         startTimestamp = block.timestamp;
+
+        emit EventStartMinting(startTimestamp);
     }
 
     /// @notice Set the farm start timestamp
     /// @param _timestamp The farm start timestamp(seconds)
     function setStartTimestamp(uint256 _timestamp) external onlyOwner {
         require(startTimestamp == 0, "Farm: already started");
+        require(_timestamp > block.timestamp, "Farm: start timestamp must be in the future");
+        require(_timestamp <= block.timestamp + 30 days, "Farm: start timestamp too far in the future");
 
         startTimestamp = _timestamp;
         emit EventSetStartTimestamp(_timestamp);
@@ -247,7 +304,8 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
 
     /// @notice Return the user cToken balance
     function balanceOf() external view returns (uint256) {
-        return mendiCToken.balanceOf(address(this));
+        uint256 cTokenAmount = mendiCToken.balanceOf(address(this));
+        return cTokenToUnderlying(cTokenAmount);
     }
 
     /// @notice Get user info
@@ -273,6 +331,16 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
         emit EventSetMendiCToken(_mendiCToken);
     }
 
+    /// @notice Pause the farm
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Unpause the farm
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
     /// @notice Distribute all of rewards to user
     /// @param _user The user address
     function distributeAllRewards(address _user) internal {
@@ -289,8 +357,9 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
                 _extraReward.updatePool();
             }
 
-            extraRewards[i].distributeReward(_user, rewardAmount);
-
+            if (rewardAmount > 0) {
+                extraRewards[i].distributeReward(_user, rewardAmount);
+            }
         }
     }
 
@@ -301,7 +370,15 @@ contract BagfulMendiCompoundFarm is Initializable, OwnableUpgradeable, Reentranc
     function updateAllRewards(address _user, uint256 _amount, bool depositFlag) internal {
         for (uint256 i = 0; i < extraRewards.length; i++) {
             if (!extraRewards[i].isRetired()) {
-                extraRewards[i].updateUserState(_user, _amount, depositFlag);
+                if (depositFlag) {
+                    extraRewards[i].updateUserState(_user, _amount, depositFlag);
+                } else {
+                    IRewardNew.UserRewardInfo memory userInfo = extraRewards[i].getUserRewardInfo(_user);
+                    if (userInfo.depositAmount > 0) {
+                        extraRewards[i].updateUserState(_user, _amount, depositFlag);
+                    }
+                }
+
             }
         }
     }

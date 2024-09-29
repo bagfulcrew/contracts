@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.0;
 
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
 library TransferHelper {
     function safeApprove(address token, address to, uint value) internal {
-        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0x095ea7b3, to, value));
+        (bool success, bytes memory data) = token.call(abi.encodeCall(IERC20.approve, (to, value)));
         require(success && (data.length == 0 || abi.decode(data, (bool))), 'TransferHelper: APPROVE FAILED');
     }
 
     function safeTransfer(address token, address to, uint value) internal {
-        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0xa9059cbb, to, value));
+        (bool success, bytes memory data) = token.call(abi.encodeCall(IERC20.transfer, (to, value)));
         require(success && (data.length == 0 || abi.decode(data, (bool))), 'TransferHelper: TRANSFER FAILED');
     }
 
     function safeTransferFrom(address token, address from, address to, uint value) internal {
-        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0x23b872dd, from, to, value));
+        (bool success, bytes memory data) = token.call(abi.encodeCall(IERC20.transferFrom, (from, to, value)));
         require(success && (data.length == 0 || abi.decode(data, (bool))), 'TransferHelper: TRANSFER FROM FAILED');
     }
 
